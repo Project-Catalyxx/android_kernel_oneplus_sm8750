@@ -462,7 +462,13 @@ static int do_get_hook_mode(void __user *arg)
 {
 	struct ksu_get_hook_mode_cmd cmd = {0};
 
+#ifndef CONFIG_KSU_SUSFS
 	strscpy(cmd.mode, "Kprobes", sizeof(cmd.mode));
+#elif defined(CONFIG_KPROBES) || defined(CONFIG_TRACEPOINTS)
+	strscpy(cmd.mode, "Hybrid", sizeof(cmd.mode));
+#else
+	strscpy(cmd.mode, "Inline", sizeof(cmd.mode));
+#endif // CONFIG_KSU_SUSFS
 
 	if (copy_to_user(arg, &cmd, sizeof(cmd))) {
 		pr_err("get_hook_mode: copy_to_user failed\n");
@@ -558,7 +564,7 @@ static int add_try_umount(void __user *arg)
         new_entry->umountable = kstrdup(buf, GFP_KERNEL);
         if (!new_entry->umountable) {
             kfree(new_entry);
-            return -1;
+            return -ENOMEM;
         }
 
         down_write(&mount_list_lock);
@@ -571,7 +577,7 @@ static int add_try_umount(void __user *arg)
                 up_write(&mount_list_lock);
                 kfree(new_entry->umountable);
                 kfree(new_entry);
-                return -1;
+                return -EEXIST;
             }
         }
 
@@ -786,6 +792,118 @@ static void ksu_install_fd_tw_func(struct callback_head *cb)
 	kfree(tw);
 }
 
+static inline bool ksu_require_root(void)
+{
+	return current_uid().val == 0;
+}
+
+// copy to userspace (reply back)
+static inline void ksu_copy_reply_user(unsigned long user_ptr, unsigned long reply)
+{
+	if (copy_to_user((void __user *)user_ptr, &reply, sizeof(reply)))
+		pr_info("sys_reboot: reply fail\n");
+}
+
+// WARNING!!! triple ptr zone! ***
+// https://wiki.c2.com/?ThreeStarProgrammer
+static int ksu_handle_change_spoof_uname(unsigned long arg4)
+{
+	// only root is allowed for this command
+	if (!ksu_require_root())
+		return 0;
+
+	char release_buf[65];
+	char version_buf[65];
+	static char original_release_buf[65] = {0};
+	static char original_version_buf[65] = {0};
+
+	// basically void * void __user * void __user *arg
+	// arg4 is a user ptr. to a user ptr. (**)
+	// no deref. from userspace; pull next ptr. via copy_from_user
+	void __user **u_ppptr = (void __user **)arg4;
+
+	// user pointer storage
+	// init this as zero so this works on 32-on-64 compat (LE)
+	uint64_t u_pptr = 0;
+	uint64_t u_ptr = 0;
+
+	unsigned long reply = arg4;
+
+	pr_info("sys_reboot: u_ppptr: 0x%lx\n", (uintptr_t)u_ppptr);
+
+	// arg here is ***, pull out user-space ** via copy_from_user (safe)
+	if (copy_from_user(&u_pptr, u_ppptr, sizeof(u_pptr)))
+		return 0;
+
+	pr_info("sys_reboot: u_pptr: 0x%lx\n", (uintptr_t)u_pptr);
+
+	// now we got the __user **
+	// we cannot dereference this as this is __user
+	// we just do another copy_from_user to get it
+	// pull out user-space * (safe)
+	if (copy_from_user(&u_ptr, (void __user *)u_pptr, sizeof(u_ptr)))
+		return 0;
+
+	pr_info("sys_reboot: u_ptr: 0x%lx\n", (uintptr_t)u_ptr);
+
+	// for release
+	if (strncpy_from_user(release_buf, (char __user *)u_ptr, sizeof(release_buf)) < 0)
+		return 0;
+	release_buf[sizeof(release_buf) - 1] = '\0';
+
+	// for version
+	if (strncpy_from_user(version_buf,
+				(char __user *)(u_ptr + strlen(release_buf) + 1),
+				sizeof(version_buf)) < 0)
+		return 0;
+	version_buf[sizeof(version_buf) - 1] = '\0';
+
+	if (original_release_buf[0] == '\0') {
+		struct new_utsname *u_curr = utsname();
+		// we save current version as the original before modifying
+		strncpy(original_release_buf, u_curr->release, sizeof(original_release_buf));
+		strncpy(original_version_buf, u_curr->version, sizeof(original_version_buf));
+		pr_info("sys_reboot: original uname saved: %s %s\n",
+			original_release_buf, original_version_buf);
+	}
+
+	// so user can reset
+	if (!strcmp(release_buf, "default") || !strcmp(version_buf, "default")) {
+		memcpy(release_buf, original_release_buf, sizeof(release_buf));
+		memcpy(version_buf, original_version_buf, sizeof(version_buf));
+	}
+
+	pr_info("sys_reboot: spoofing kernel to: %s - %s\n",
+		release_buf, version_buf);
+
+#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME
+	int ret = 0;
+	extern bool susfs_uname_is_active(void);
+	extern int susfs_set_uname_from_kernel(const char *release, const char *version);
+
+	if (susfs_uname_is_active()) {
+	// SuSFS spoof on; return success (allows toolkit to change its config. (i.e. on-boot apply))
+	// no changes (original reply (arg4))
+	} else {
+	// SuSFS spoof off; toolkit updates spoof buffer via helper
+		ret = susfs_set_uname_from_kernel(release_buf, version_buf);
+		if (ret < 0)
+			reply = (unsigned long)ret; // fail-path
+	}
+#else
+	struct new_utsname *u = utsname();
+
+	down_write(&uts_sem);
+	strncpy(u->release, release_buf, sizeof(u->release));
+	strncpy(u->version, version_buf, sizeof(u->version));
+	up_write(&uts_sem);
+#endif
+
+	// we write our confirmation on **
+	ksu_copy_reply_user(arg4, reply);
+	return 0;
+}
+
 #ifndef CONFIG_KSU_SUSFS
 static int reboot_handler_pre(struct kprobe *p, struct pt_regs *regs)
 {
@@ -795,6 +913,7 @@ static int reboot_handler_pre(struct kprobe *p, struct pt_regs *regs)
 	unsigned int cmd = (unsigned int)PT_REGS_PARM3(real_regs);
 	unsigned long arg4 = (unsigned long)PT_REGS_SYSCALL_PARM4(real_regs);
 	unsigned long reply = (unsigned long)arg4;
+	unsigned long user_ptr = reply;
 
 	/* Check if this is a request to install KSU fd */
 	if (magic1 == KSU_INSTALL_MAGIC1 && magic2 == KSU_INSTALL_MAGIC2) {
@@ -815,116 +934,43 @@ static int reboot_handler_pre(struct kprobe *p, struct pt_regs *regs)
 
 	if (magic2 == CHANGE_MANAGER_UID) {
 		/* only root is allowed for this command */
-		if (current_uid().val != 0)
+		if (!ksu_require_root())
 			return 0;
 
 		pr_info("sys_reboot: ksu_set_manager_appid to: %d\n", cmd);
 		ksu_set_manager_appid(cmd);
 
-		if (cmd == ksu_get_manager_appid()) {
-			if (copy_to_user((void __user *)arg4, &reply, sizeof(reply)))
-				pr_info("sys_reboot: reply fail\n");
-		}
+		if (cmd == ksu_get_manager_appid())
+			ksu_copy_reply_user(user_ptr, reply);
 
 		return 0;
 	}
 
 	if (magic2 == GET_SULOG_DUMP_V2) {
-		if (current_uid().val != 0)
+		if (!ksu_require_root())
 			return 0;
 
 		int ret = send_sulog_dump((void __user *)arg4);
-            if (ret)
-                return 0;
+		if (ret)
+			return 0;
 
-        if (copy_to_user((void __user *)arg4, &reply, sizeof(reply) ))
-            return 0;
+		ksu_copy_reply_user(user_ptr, reply);
+		return 0;
 	}
 
-    if (magic2 == CHANGE_KSUVER) {
-        if (current_uid().val != 0)
-            return 0;
-
-        pr_info("sys_reboot: ksu_change_ksuver to: %d\n", cmd);
-        ksuver_override = cmd;
-
-        if (copy_to_user((void __user *)arg4, &reply, sizeof(reply) ))
-            return 0;
-    }
-
-	// WARNING!!! triple ptr zone! ***
-	// https://wiki.c2.com/?ThreeStarProgrammer
-	if (magic2 == CHANGE_SPOOF_UNAME) {
-		// only root is allowed for this command 
-		if (current_uid().val != 0)
+	if (magic2 == CHANGE_KSUVER) {
+		if (!ksu_require_root())
 			return 0;
 
-		char release_buf[65];
-		char version_buf[65];
-		static char original_release_buf[65] = {0};
-		static char original_version_buf[65] = {0};
+		pr_info("sys_reboot: ksu_change_ksuver to: %d\n", cmd);
+		ksuver_override = cmd;
 
-		// basically void * void __user * void __user *arg
-		void __user **ppptr = (void __user **)arg4;
-
-		// user pointer storage
-		// init this as zero so this works on 32-on-64 compat (LE)
-		uint64_t u_pptr = 0;
-		uint64_t u_ptr = 0;
-
-		pr_info("sys_reboot: ppptr: 0x%lx \n", (uintptr_t)ppptr);
-
-		// arg here is ***, pull out user-space ** via copy_from_user
-		if (copy_from_user(&u_pptr, ppptr, sizeof(u_pptr)))
-			return 0;
-
-		pr_info("sys_reboot: u_pptr: 0x%lx \n", (uintptr_t)u_pptr);
-
-		// now we got the __user **
-		// we cannot dereference this as this is __user
-		// we just do another copy_from_user to get it
-		if (copy_from_user(&u_ptr, (void __user *)u_pptr, sizeof(u_ptr)))
-			return 0;
-
-		pr_info("sys_reboot: u_ptr: 0x%lx \n", (uintptr_t)u_ptr);
-
-		// for release
-		if (strncpy_from_user(release_buf, (char __user *)u_ptr, sizeof(release_buf)) < 0)
-			return 0;
-		release_buf[sizeof(release_buf) - 1] = '\0'; 
-
-		// for version
-		if (strncpy_from_user(version_buf, (char __user *)(u_ptr + strlen(release_buf) + 1), sizeof(version_buf)) < 0)
-			return 0;
-		version_buf[sizeof(version_buf) - 1] = '\0'; 
-
-		if (original_release_buf[0] == '\0') {
-			struct new_utsname *u_curr = utsname();
-			// we save current version as the original before modifying
-			strncpy(original_release_buf, u_curr->release, sizeof(original_release_buf));
-			strncpy(original_version_buf, u_curr->version, sizeof(original_version_buf));
-			pr_info("sys_reboot: original uname saved: %s %s\n", original_release_buf, original_version_buf);
-		}
-
-		// so user can reset
-		if (!strcmp(release_buf, "default") || !strcmp(version_buf, "default") ) {
-			memcpy(release_buf, original_release_buf, sizeof(release_buf));
-			memcpy(version_buf, original_version_buf, sizeof(version_buf));
-		}
-
-		pr_info("sys_reboot: spoofing kernel to: %s - %s\n", release_buf, version_buf);
-
-		struct new_utsname *u = utsname();
-
-		down_write(&uts_sem);
-		strncpy(u->release, release_buf, sizeof(u->release));
-		strncpy(u->version, version_buf, sizeof(u->version));
-		up_write(&uts_sem);
-
-		// we write our confirmation on **
-		if (copy_to_user((void __user *)arg4, &reply, sizeof(reply)))
-			return 0;
+		ksu_copy_reply_user(user_ptr, reply);
+		return 0;
 	}
+
+	if (magic2 == CHANGE_SPOOF_UNAME)
+		return ksu_handle_change_spoof_uname(arg4);
 
 	return 0;
 }
@@ -936,6 +982,10 @@ static struct kprobe reboot_kp = {
 #else
 int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user **arg)
 {
+	// User's pointer -> reply
+	unsigned long reply = (unsigned long)(*arg);
+	unsigned long user_ptr = reply;
+
 	if (magic1 != KSU_INSTALL_MAGIC1) {
 		return -EINVAL;
 	}
@@ -959,13 +1009,13 @@ int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user 
 			susfs_set_i_state_on_external_dir(arg);
 			return 0;
 		}
-#endif //#ifdef CONFIG_KSU_SUSFS_SUS_PATH
+#endif // #ifdef CONFIG_KSU_SUSFS_SUS_PATH
 #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
 		if (cmd == CMD_SUSFS_HIDE_SUS_MNTS_FOR_NON_SU_PROCS) {
 			susfs_set_hide_sus_mnts_for_non_su_procs(arg);
 			return 0;
 		}
-#endif //#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
 #ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
 		if (cmd == CMD_SUSFS_ADD_SUS_KSTAT) {
 			susfs_add_sus_kstat(arg);
@@ -979,31 +1029,31 @@ int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user 
 			susfs_add_sus_kstat(arg);
 			return 0;
 		}
-#endif //#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
+#endif // #ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
 #ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME
 		if (cmd == CMD_SUSFS_SET_UNAME) {
 			susfs_set_uname(arg);
 			return 0;
 		}
-#endif //#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME
+#endif // #ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME
 #ifdef CONFIG_KSU_SUSFS_ENABLE_LOG
 		if (cmd == CMD_SUSFS_ENABLE_LOG) {
 			susfs_enable_log(arg);
 			return 0;
 		}
-#endif //#ifdef CONFIG_KSU_SUSFS_ENABLE_LOG
+#endif // #ifdef CONFIG_KSU_SUSFS_ENABLE_LOG
 #ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
 		if (cmd == CMD_SUSFS_SET_CMDLINE_OR_BOOTCONFIG) {
 			susfs_set_cmdline_or_bootconfig(arg);
 			return 0;
 		}
-#endif //#ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
+#endif // #ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
 #ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT
 		if (cmd == CMD_SUSFS_ADD_OPEN_REDIRECT) {
 			susfs_add_open_redirect(arg);
 			return 0;
 		}
-#endif //#ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT
+#endif // #ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT
 #ifdef CONFIG_KSU_SUSFS_SUS_MAP
 		if (cmd == CMD_SUSFS_ADD_SUS_MAP) {
 			susfs_add_sus_map(arg);
@@ -1045,8 +1095,50 @@ int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user 
 			pr_warn("install fd add task_work failed\n");
 		}
 	}
+
+	if (magic2 == CHANGE_MANAGER_UID) {
+		/* only root is allowed for this command */
+		if (!ksu_require_root())
+			return 0;
+
+		pr_info("sys_reboot: ksu_set_manager_appid to: %d\n", cmd);
+		ksu_set_manager_appid(cmd);
+
+		if (cmd == ksu_get_manager_appid())
+			ksu_copy_reply_user(user_ptr, reply);
+
+		return 0;
+	}
+
+	if (magic2 == GET_SULOG_DUMP_V2) {
+		if (!ksu_require_root())
+			return 0;
+
+		int ret = send_sulog_dump((void __user *)*arg);
+		if (ret)
+			return 0;
+
+		ksu_copy_reply_user(user_ptr, reply);
+		return 0;
+	}
+
+	if (magic2 == CHANGE_KSUVER) {
+		if (!ksu_require_root())
+			return 0;
+
+		pr_info("sys_reboot: ksu_change_ksuver to: %d\n", cmd);
+		ksuver_override = cmd;
+
+		ksu_copy_reply_user(user_ptr, reply);
+		return 0;
+	}
+
+	if (magic2 == CHANGE_SPOOF_UNAME)
+		return ksu_handle_change_spoof_uname((unsigned long)*arg);
+
 	return 0;
 }
+EXPORT_SYMBOL(ksu_handle_sys_reboot); // required visiblity for toolkit
 #endif // #ifndef CONFIG_KSU_SUSFS
 
 void ksu_supercalls_init(void)
