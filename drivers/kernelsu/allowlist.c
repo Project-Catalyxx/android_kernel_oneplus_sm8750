@@ -15,13 +15,11 @@
 #include <linux/compiler_types.h>
 
 #include "klog.h" // IWYU pragma: keep
+#include "ksu.h"
 #include "ksud.h"
 #include "selinux/selinux.h"
 #include "allowlist.h"
 #include "manager.h"
-#ifndef CONFIG_KSU_SUSFS
-#include "syscall_hook_manager.h"
-#endif // #ifndef CONFIG_KSU_SUSFS
 #include "su_mount_ns.h"
 
 #define FILE_MAGIC 0x7f4b5355 // ' KSU', u32
@@ -183,18 +181,20 @@ int ksu_set_app_profile(struct app_profile *profile)
 
     list_for_each_entry (p, &allow_list, list) {
         ++count;
+        // both uid and package must match, otherwise it will break multiple package with different user id
         if (profile->current_uid == p->profile.current_uid &&
             !strcmp(profile->key, p->profile.key)) {
-            
-            np = (struct perm_data *)kzalloc(sizeof(struct perm_data), GFP_KERNEL);
+            // found it, just override it all!
+            np = (struct perm_data *)kzalloc(sizeof(struct perm_data),
+                                             GFP_KERNEL);
             if (!np) {
                 result = -ENOMEM;
-                goto out_unlock; // Correctly goes to unlock
+                goto out_unlock;
             }
             memcpy(&np->profile, profile, sizeof(*profile));
             list_replace_rcu(&p->list, &np->list);
             kfree_rcu(p, rcu);
-            goto out; // Goes to process logic, then unlock
+            goto out;
         }
     }
 
@@ -204,22 +204,39 @@ int ksu_set_app_profile(struct app_profile *profile)
         goto out_unlock;
     }
 
+    // not found, alloc a new node!
     p = (struct perm_data *)kzalloc(sizeof(struct perm_data), GFP_KERNEL);
     if (!p) {
+        pr_err("ksu_set_app_profile alloc failed\n");
         result = -ENOMEM;
         goto out_unlock;
     }
 
     memcpy(&p->profile, profile, sizeof(*profile));
+    if (profile->allow_su) {
+        pr_info("set root profile, key: %s, uid: %d, gid: %d, context: %s\n",
+                profile->key, profile->current_uid,
+                profile->rp_config.profile.gid,
+                profile->rp_config.profile.selinux_domain);
+    } else {
+        pr_info("set app profile, key: %s, uid: %d, umount modules: %d\n",
+                profile->key, profile->current_uid,
+                profile->nrp_config.profile.umount_modules);
+    }
+
     list_add_tail_rcu(&p->list, &allow_list);
 
 out:
-    // This logic MUST happen before the unlock or right after it, 
-    // but the 'result = 0' and return must follow the unlock.
+    result = 0;
+
+    // check if the default profiles is changed, cache it to a single struct to accelerate access.
     if (unlikely(!strcmp(profile->key, "$"))) {
+        // set default non root profile
         memcpy(&default_non_root_profile, &profile->nrp_config.profile,
                sizeof(default_non_root_profile));
     } else if (unlikely(!strcmp(profile->key, "#"))) {
+        // set default root profile
+        // TODO: Do we really need this?
         memcpy(&default_root_profile, &profile->rp_config.profile,
                sizeof(default_root_profile));
     } else if (profile->current_uid <= BITMAP_UID_MAX) {
@@ -231,17 +248,23 @@ out:
                 ~(1 << (profile->current_uid % BITS_PER_BYTE));
     } else {
         if (profile->allow_su) {
-            if (allow_list_pointer < ARRAY_SIZE(allow_list_arr)) {
+            /*
+             * 1024 apps with uid higher than BITMAP_UID_MAX
+             * registered to request superuser?
+             */
+            if (allow_list_pointer >= ARRAY_SIZE(allow_list_arr)) {
+                pr_err("too many apps registered\n");
+                WARN_ON(1);
+            } else {
                 allow_list_arr[allow_list_pointer++] = profile->current_uid;
             }
         } else {
             remove_uid_from_arr(profile->current_uid);
         }
     }
-    result = 0;
 
 out_unlock:
-    mutex_unlock(&allowlist_mutex); // THIS IS THE FIX
+    mutex_unlock(&allowlist_mutex);
     return result;
 }
 
@@ -369,6 +392,7 @@ static void do_persistent_allow_list(struct callback_head *_cb)
     struct perm_data *p = NULL;
     loff_t off = 0;
 
+    const struct cred *saved = override_creds(ksu_cred);
     struct file *fp =
         filp_open(KERNEL_SU_ALLOWLIST, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (IS_ERR(fp)) {
@@ -399,6 +423,7 @@ static void do_persistent_allow_list(struct callback_head *_cb)
 close_file:
     filp_close(fp, 0);
 out:
+    revert_creds(saved);
     kfree(_cb);
 }
 

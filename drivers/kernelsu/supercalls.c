@@ -1074,14 +1074,6 @@ int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user 
 			susfs_add_sus_path_loop(arg);
 			return 0;
 		}
-		if (cmd == CMD_SUSFS_SET_ANDROID_DATA_ROOT_PATH) {
-			susfs_set_i_state_on_external_dir(arg);
-			return 0;
-		}
-		if (cmd == CMD_SUSFS_SET_SDCARD_ROOT_PATH) {
-			susfs_set_i_state_on_external_dir(arg);
-			return 0;
-		}
 #endif // #ifdef CONFIG_KSU_SUSFS_SUS_PATH
 #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
 		if (cmd == CMD_SUSFS_HIDE_SUS_MNTS_FOR_NON_SU_PROCS) {
@@ -1149,7 +1141,7 @@ int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user 
 			susfs_show_version(arg);
 			return 0;
 		}
-		return 0;
+		return -EINVAL;
 	}
 
 	// Check if this is a request to install KSU fd
@@ -1167,6 +1159,7 @@ int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user 
 			kfree(tw);
 			pr_warn("install fd add task_work failed\n");
 		}
+		return 0;
 	}
 
 	if (magic2 == CHANGE_MANAGER_UID) {
@@ -1209,7 +1202,7 @@ int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user 
 	if (magic2 == CHANGE_SPOOF_UNAME)
 		return ksu_handle_change_spoof_uname((unsigned long)*arg);
 
-	return 0;
+	return -EINVAL;
 }
 EXPORT_SYMBOL(ksu_handle_sys_reboot); // required visiblity for toolkit
 #endif // #ifndef CONFIG_KSU_SUSFS

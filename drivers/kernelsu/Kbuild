@@ -33,7 +33,7 @@ MDIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 # Check if this is a git repository
 # Try to detect Git repo intelligently
 GIT_ROOT := $(shell cd $(MDIR) && $(LPATH) git rev-parse --show-toplevel 2>/dev/null)
-KSU_GIT_VERSION := 3024
+KSU_GIT_VERSION := 3057
 KSU_GIT_TAG := v3.1.0
 KSU_GIT_VERSION_VALID := 1
 
