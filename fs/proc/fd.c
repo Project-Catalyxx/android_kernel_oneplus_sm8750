@@ -15,9 +15,9 @@
 #include <linux/filelock.h>
 
 #include <linux/proc_fs.h>
-#if defined(CONFIG_KSU_SUSFS_SUS_MOUNT) || defined(CONFIG_KSU_SUSFS_OPEN_REDIRECT)
+#if defined(CONFIG_KSU_SUSFS_SUS_MOUNT) || defined(CONFIG_KSU_SUSFS_SUS_KSTAT)
 #include <linux/susfs_def.h>
-#endif // #if defined(CONFIG_KSU_SUSFS_SUS_MOUNT) || defined(CONFIG_KSU_SUSFS_OPEN_REDIRECT)
+#endif // #if defined(CONFIG_KSU_SUSFS_SUS_MOUNT) || defined(CONFIG_KSU_SUSFS_SUS_KSTAT)
 
 #include "../mount.h"
 #include "internal.h"
@@ -31,10 +31,6 @@ extern bool susfs_is_inode_sus_kstat(struct inode *inode, bool *out_is_fuse);
 extern void susfs_sus_kstat_spoof_proc_fd_seq_show(int *out_target_mnt_id, unsigned long *out_target_ino, dev_t target_dev);
 #endif // #ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
 
-#ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT
-extern int susfs_open_redirect_spoof_seq_show(struct inode *inode, int *out_mnt_id, unsigned long *out_ino);
-#endif // #ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT
-
 static int seq_show(struct seq_file *m, void *v)
 {
 	struct files_struct *files = NULL;
@@ -44,10 +40,6 @@ static int seq_show(struct seq_file *m, void *v)
 #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
 	struct mount *mnt = NULL;
 #endif // #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
-#ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT
-	int mnt_id = 0;
-	unsigned long ino = 0;
-#endif // #ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT
 
 	task = get_proc_task(m->private);
 	if (!task)
@@ -133,19 +125,7 @@ out_kfree:
 	}
 #endif // #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
 
-#ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT
-	if (SUSFS_IS_INODE_OPEN_REDIRECT(file_inode(file))) {
-		if (susfs_open_redirect_spoof_seq_show(file_inode(file), &mnt_id, &ino))
-			goto orig_flow;
-		seq_printf(m, "pos:\t%lli\nflags:\t0%o\nmnt_id:\t%i\nino:\t%lu\n",
-				(long long)file->f_pos, f_flags,
-				mnt_id,
-				ino);
-		goto bypass_orig_flow;
-	}
-#endif // #ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT
-
-#if defined(CONFIG_KSU_SUSFS_SUS_MOUNT) || defined(CONFIG_KSU_SUSFS_OPEN_REDIRECT) || defined(CONFIG_KSU_SUSFS_SUS_KSTAT)
+#if defined(CONFIG_KSU_SUSFS_SUS_MOUNT) || defined(CONFIG_KSU_SUSFS_SUS_KSTAT)
 orig_flow:
 	seq_printf(m, "pos:\t%lli\nflags:\t0%o\nmnt_id:\t%i\nino:\t%lu\n",
 			(long long)file->f_pos, f_flags,
@@ -158,7 +138,7 @@ bypass_orig_flow:
 		   (long long)file->f_pos, f_flags,
 		   real_mount(file->f_path.mnt)->mnt_id,
 		   file_inode(file)->i_ino);
-#endif // #if defined(CONFIG_KSU_SUSFS_SUS_MOUNT) || defined(CONFIG_KSU_SUSFS_OPEN_REDIRECT) || defined(CONFIG_KSU_SUSFS_SUS_KSTAT)
+#endif // #if defined(CONFIG_KSU_SUSFS_SUS_MOUNT) || defined(CONFIG_KSU_SUSFS_SUS_KSTAT)
 
 	/* show_fd_locks() never deferences files so a stale value is safe */
 	show_fd_locks(m, file, files);
