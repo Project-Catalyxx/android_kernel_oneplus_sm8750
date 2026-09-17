@@ -1403,6 +1403,9 @@ bypass_orig_flow:
 	mnt->mnt.mnt_flags &= ~(MNT_WRITE_HOLD|MNT_MARKED|MNT_INTERNAL);
 
 #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
+	/* mnt_id came from ida here, so don't inherit old's no-ida marker */
+	mnt->mnt.mnt_flags &= ~VFSMOUNT_MNT_FLAGS_KSU_UNSHARED_MNT;
+
 	if (unlikely(is_mnt_ksu_unshared))
 		mnt->mnt.mnt_flags |= VFSMOUNT_MNT_FLAGS_KSU_UNSHARED_MNT;
 #endif // #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT
