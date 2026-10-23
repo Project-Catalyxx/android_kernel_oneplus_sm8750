@@ -175,3 +175,7 @@ sphinx_*/
 
 # Rust analyzer configuration
 /rust-project.json
+
+# ReSukiSU (KernelSU), a separate repo project checked out here for the
+# drivers/kernelsu symlink (see .repo/local_manifests/dodge.xml)
+/KernelSU/
